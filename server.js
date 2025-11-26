@@ -1,15 +1,10 @@
+// server.js - Simplified version for Render deployment
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import { v4 as uuidv4 } from 'uuid';
-
-// Import utilities
-import { generateBingoCard, checkWinCondition, getWinningPattern } from './utils/gameLogic.js';
-import { validateGameId, validatePlayerData } from './middleware/validation.js';
 
 dotenv.config();
 
@@ -18,254 +13,166 @@ const server = createServer(app);
 const io = new Server(server, {
   cors: {
     origin: process.env.FRONTEND_URL || "*",
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000
+    methods: ["GET", "POST"]
+  }
 });
 
-// Security middleware
-app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*",
-  credentials: true
-}));
-app.use(express.json({ limit: '10mb' }));
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
-});
-app.use(limiter);
-
-// Game state storage
+// In-memory storage
 const gameRooms = new Map();
 const playerConnections = new Map();
-const activeIntervals = new Map();
 
-// Cleanup inactive games (24 hours)
-setInterval(() => {
-  const now = Date.now();
-  const twentyFourHours = 24 * 60 * 60 * 1000;
-  
-  for (const [gameId, game] of gameRooms.entries()) {
-    if (now - game.createdAt > twentyFourHours) {
-      // Cleanup intervals
-      if (activeIntervals.has(gameId)) {
-        clearInterval(activeIntervals.get(gameId));
-        activeIntervals.delete(gameId);
+// Utility functions
+function generateBingoCard() {
+  const ranges = [
+    { min: 1, max: 15 }, { min: 16, max: 30 }, { min: 31, max: 45 },
+    { min: 46, max: 60 }, { min: 61, max: 75 }
+  ];
+
+  const card = [];
+  for (let col = 0; col < 5; col++) {
+    const numbers = generateColumnNumbers(ranges[col].min, ranges[col].max);
+    for (let row = 0; row < 5; row++) {
+      if (row === 2 && col === 2) {
+        card.push({ number: 'FREE', isFree: true, row, col, index: row * 5 + col });
+      } else {
+        card.push({ number: numbers[row], isFree: false, row, col, index: row * 5 + col });
       }
-      
-      // Remove game
-      gameRooms.delete(gameId);
-      console.log(`Cleaned up inactive game: ${gameId}`);
     }
   }
-}, 60 * 60 * 1000); // Run every hour
+  return card;
+}
+
+function generateColumnNumbers(min, max) {
+  const numbers = [];
+  while (numbers.length < 5) {
+    const num = Math.floor(Math.random() * (max - min + 1)) + min;
+    if (!numbers.includes(num)) numbers.push(num);
+  }
+  return numbers;
+}
+
+function checkWinCondition(markedCells) {
+  // Check rows
+  for (let row = 0; row < 5; row++) {
+    let complete = true;
+    for (let col = 0; col < 5; col++) {
+      const idx = row * 5 + col;
+      if (idx !== 12 && !markedCells.has(idx)) complete = false;
+    }
+    if (complete) return true;
+  }
+
+  // Check columns
+  for (let col = 0; col < 5; col++) {
+    let complete = true;
+    for (let row = 0; row < 5; row++) {
+      const idx = row * 5 + col;
+      if (idx !== 12 && !markedCells.has(idx)) complete = false;
+    }
+    if (complete) return true;
+  }
+
+  // Check diagonals
+  let mainComplete = true, antiComplete = true;
+  for (let i = 0; i < 5; i++) {
+    const mainIdx = i * 5 + i;
+    const antiIdx = i * 5 + (4 - i);
+    if (mainIdx !== 12 && !markedCells.has(mainIdx)) mainComplete = false;
+    if (antiIdx !== 12 && !markedCells.has(antiIdx)) antiComplete = false;
+  }
+  if (mainComplete && antiComplete) return true;
+
+  // Check corners
+  const corners = [0, 4, 20, 24];
+  if (corners.every(idx => markedCells.has(idx))) return true;
+
+  return false;
+}
 
 // API Routes
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Multiplayer Bingo Backend', 
-    version: '1.0.0',
-    endpoints: {
-      stats: '/api/stats',
-      gameInfo: '/api/game/:id'
-    }
-  });
+  res.json({ message: 'Bingo Backend API', status: 'running' });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/stats', (req, res) => {
-  const stats = {
+  res.json({
     activeGames: gameRooms.size,
     totalPlayers: Array.from(gameRooms.values()).reduce((sum, room) => sum + room.players.size, 0),
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
-  };
-  res.json(stats);
-});
-
-app.get('/api/game/:id', validateGameId, (req, res) => {
-  const gameId = req.params.id.toUpperCase();
-  const gameRoom = gameRooms.get(gameId);
-  
-  if (!gameRoom) {
-    return res.status(404).json({ error: 'Game not found' });
-  }
-
-  res.json({
-    gameId: gameRoom.id,
-    playerCount: gameRoom.players.size,
-    isActive: gameRoom.isGameActive,
-    host: gameRoom.host,
-    createdAt: gameRoom.createdAt,
-    calledNumbers: gameRoom.calledNumbers.length
+    uptime: process.uptime()
   });
 });
 
 app.post('/api/game/create', (req, res) => {
   const { playerName, playerId } = req.body;
-  
-  if (!playerName || !playerId) {
-    return res.status(400).json({ error: 'Player name and ID are required' });
-  }
-
   const gameId = uuidv4().slice(0, 8).toUpperCase();
   
-  const gameRoom = {
+  gameRooms.set(gameId, {
     id: gameId,
     host: playerId,
     players: new Map(),
     calledNumbers: [],
     isGameActive: false,
-    createdAt: Date.now(),
-    settings: {
-      maxPlayers: 8,
-      numberCallInterval: 3000, // 3 seconds
-      winConditions: ['row-column', 'diagonals', 'corners']
-    },
-    stats: {
-      numbersCalled: 0,
-      gameDuration: 0
-    }
-  };
-
-  gameRooms.set(gameId, gameRoom);
-  
-  console.log(`Game ${gameId} created by ${playerName}`);
-  
-  res.json({
-    success: true,
-    gameId,
-    message: 'Game created successfully'
+    createdAt: Date.now()
   });
+
+  res.json({ success: true, gameId });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    memory: process.memoryUsage(),
-    games: gameRooms.size
-  });
-});
-
-// Socket.io connection handling
+// Socket.io
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id, 'Total connections:', io.engine.clientsCount);
+  console.log('User connected:', socket.id);
 
-  // Create new game room
   socket.on('create-game', (data) => {
-    try {
-      const { playerName, playerId } = data;
-      
-      if (!validatePlayerData(data)) {
-        socket.emit('error', { message: 'Invalid player data' });
-        return;
-      }
+    const { playerName, playerId } = data;
+    const gameId = uuidv4().slice(0, 8).toUpperCase();
+    
+    const gameRoom = {
+      id: gameId,
+      host: playerId,
+      players: new Map(),
+      calledNumbers: [],
+      isGameActive: false,
+      createdAt: Date.now()
+    };
 
-      const gameId = uuidv4().slice(0, 8).toUpperCase();
-      
-      const gameRoom = {
-        id: gameId,
-        host: playerId,
-        players: new Map(),
-        calledNumbers: [],
-        isGameActive: false,
-        createdAt: Date.now(),
-        settings: {
-          maxPlayers: 8,
-          numberCallInterval: 3000,
-          winConditions: ['row-column', 'diagonals', 'corners']
-        },
-        stats: {
-          numbersCalled: 0,
-          gameDuration: 0
-        }
-      };
-
-      gameRooms.set(gameId, gameRoom);
-      
-      // Add host to game
-      joinGame(socket, gameId, playerId, playerName);
-      
-      socket.emit('game-created', { 
-        gameId, 
-        message: 'Game created successfully! Share the code with friends.' 
-      });
-      
-      console.log(`Game ${gameId} created by ${playerName}`);
-    } catch (error) {
-      console.error('Error creating game:', error);
-      socket.emit('error', { message: 'Failed to create game' });
-    }
+    gameRooms.set(gameId, gameRoom);
+    joinGame(socket, gameId, playerId, playerName);
+    socket.emit('game-created', { gameId });
   });
 
-  // Join existing game
   socket.on('join-game', (data) => {
-    try {
-      const { gameId, playerId, playerName } = data;
-      
-      if (!validatePlayerData(data)) {
-        socket.emit('error', { message: 'Invalid player data' });
-        return;
-      }
-
-      joinGame(socket, gameId, playerId, playerName);
-    } catch (error) {
-      console.error('Error joining game:', error);
-      socket.emit('error', { message: 'Failed to join game' });
-    }
+    const { gameId, playerId, playerName } = data;
+    joinGame(socket, gameId, playerId, playerName);
   });
 
   function joinGame(socket, gameId, playerId, playerName) {
     const gameRoom = gameRooms.get(gameId);
-    
     if (!gameRoom) {
-      socket.emit('error', { message: 'Game not found!' });
+      socket.emit('error', { message: 'Game not found' });
       return;
     }
 
-    if (gameRoom.players.size >= gameRoom.settings.maxPlayers) {
-      socket.emit('error', { message: 'Game is full! Maximum 8 players allowed.' });
-      return;
-    }
-
-    if (gameRoom.isGameActive) {
-      socket.emit('error', { message: 'Game has already started!' });
-      return;
-    }
-
-    // Check if player already exists in game
-    if (gameRoom.players.has(playerId)) {
-      socket.emit('error', { message: 'You are already in this game!' });
-      return;
-    }
-
-    // Create player
     const player = {
       id: playerId,
       name: playerName,
       socketId: socket.id,
       card: generateBingoCard(),
-      markedCells: new Set([12]), // FREE space is always marked
-      isReady: false,
-      isHost: playerId === gameRoom.host,
-      joinedAt: Date.now(),
-      lastActivity: Date.now()
+      markedCells: new Set([12]),
+      isHost: playerId === gameRoom.host
     };
 
-    // Add player to game
     gameRoom.players.set(playerId, player);
     playerConnections.set(socket.id, { gameId, playerId });
-
-    // Join socket room
     socket.join(gameId);
 
-    // Send game state to the joining player
     socket.emit('game-joined', {
       game: {
         id: gameRoom.id,
@@ -273,366 +180,113 @@ io.on('connection', (socket) => {
         isGameActive: gameRoom.isGameActive,
         calledNumbers: gameRoom.calledNumbers,
         players: Array.from(gameRoom.players.values()).map(p => ({
-          id: p.id,
-          name: p.name,
-          isHost: p.isHost,
-          isReady: p.isReady,
-          markedCount: p.markedCells.size
+          id: p.id, name: p.name, isHost: p.isHost, markedCount: p.markedCells.size
         }))
       },
-      player: {
-        id: player.id,
-        name: player.name,
-        isHost: player.isHost,
-        card: player.card
-      }
+      player: { id: player.id, name: player.name, isHost: player.isHost, card: player.card }
     });
 
-    // Notify other players
     socket.to(gameId).emit('player-joined', {
-      player: {
-        id: player.id,
-        name: player.name,
-        isHost: player.isHost,
-        isReady: player.isReady,
-        markedCount: player.markedCells.size
-      },
+      player: { id: player.id, name: player.name, isHost: player.isHost, markedCount: player.markedCells.size },
       players: Array.from(gameRoom.players.values()).map(p => ({
-        id: p.id,
-        name: p.name,
-        isHost: p.isHost,
-        isReady: p.isReady,
-        markedCount: p.markedCells.size
+        id: p.id, name: p.name, isHost: p.isHost, markedCount: p.markedCells.size
       }))
     });
-
-    console.log(`Player ${playerName} joined game ${gameId}. Total players: ${gameRoom.players.size}`);
   }
 
-  // Start game
   socket.on('start-game', (data) => {
     const { gameId } = data;
     const connection = playerConnections.get(socket.id);
-    
-    if (!connection) {
-      socket.emit('error', { message: 'Not connected to a game!' });
-      return;
-    }
-    
     const gameRoom = gameRooms.get(gameId);
-    if (!gameRoom || gameRoom.host !== connection.playerId) {
-      socket.emit('error', { message: 'Only the host can start the game!' });
-      return;
+    
+    if (gameRoom && gameRoom.host === connection.playerId) {
+      gameRoom.isGameActive = true;
+      startNumberCalling(gameId);
+      io.to(gameId).emit('game-started', { startedAt: Date.now() });
     }
-
-    if (gameRoom.players.size < 2) {
-      socket.emit('error', { message: 'Need at least 2 players to start!' });
-      return;
-    }
-
-    if (gameRoom.isGameActive) {
-      socket.emit('error', { message: 'Game is already active!' });
-      return;
-    }
-
-    gameRoom.isGameActive = true;
-    gameRoom.startedAt = Date.now();
-
-    // Start number calling
-    startNumberCalling(gameId);
-
-    io.to(gameId).emit('game-started', {
-      startedAt: gameRoom.startedAt,
-      calledNumbers: gameRoom.calledNumbers
-    });
-
-    console.log(`Game ${gameId} started with ${gameRoom.players.size} players`);
   });
 
-  // Mark cell
   socket.on('mark-cell', (data) => {
     const { gameId, cellIndex } = data;
     const connection = playerConnections.get(socket.id);
-    
-    if (!connection) {
-      socket.emit('error', { message: 'Not connected to a game!' });
-      return;
-    }
-    
     const gameRoom = gameRooms.get(gameId);
-    if (!gameRoom || !gameRoom.isGameActive) {
-      socket.emit('error', { message: 'Game is not active!' });
-      return;
-    }
+    const player = gameRoom?.players.get(connection.playerId);
 
-    const player = gameRoom.players.get(connection.playerId);
-    if (!player) {
-      socket.emit('error', { message: 'Player not found in game!' });
-      return;
-    }
-
-    // Update last activity
-    player.lastActivity = Date.now();
-
-    // Validate the cell can be marked
-    const cell = player.card.find(c => c.index === cellIndex);
-    if (!cell || cell.isFree) {
-      socket.emit('error', { message: 'Invalid cell!' });
-      return;
-    }
-
-    // Check if number has been called
-    if (!gameRoom.calledNumbers.includes(cell.number)) {
-      socket.emit('error', { message: `Number ${cell.number} hasn't been called yet!` });
-      return;
-    }
-
-    // Check if cell is already marked
-    if (player.markedCells.has(cellIndex)) {
-      socket.emit('error', { message: 'Cell already marked!' });
-      return;
-    }
-
-    // Mark the cell
-    player.markedCells.add(cellIndex);
-
-    // Check for win
-    if (checkWinCondition(player.markedCells)) {
-      const winningPattern = getWinningPattern(player.markedCells);
-      
-      gameRoom.isGameActive = false;
-      gameRoom.winner = player.id;
-      gameRoom.finishedAt = Date.now();
-      gameRoom.stats.gameDuration = gameRoom.finishedAt - gameRoom.startedAt;
-      gameRoom.stats.numbersCalled = gameRoom.calledNumbers.length;
-
-      // Stop number calling
-      if (activeIntervals.has(gameId)) {
-        clearInterval(activeIntervals.get(gameId));
-        activeIntervals.delete(gameId);
+    if (player && gameRoom?.isGameActive) {
+      const cell = player.card.find(c => c.index === cellIndex);
+      if (cell && !cell.isFree && gameRoom.calledNumbers.includes(cell.number)) {
+        player.markedCells.add(cellIndex);
+        
+        if (checkWinCondition(player.markedCells)) {
+          gameRoom.isGameActive = false;
+          io.to(gameId).emit('player-won', {
+            winner: { id: player.id, name: player.name }
+          });
+        } else {
+          socket.to(gameId).emit('player-marked-cell', {
+            playerId: player.id, markedCount: player.markedCells.size
+          });
+        }
+        
+        socket.emit('cell-marked', { cellIndex });
       }
-
-      // Notify all players
-      io.to(gameId).emit('player-won', {
-        winner: {
-          id: player.id,
-          name: player.name,
-          markedCells: Array.from(player.markedCells),
-          winningPattern: winningPattern,
-          card: player.card
-        },
-        gameDuration: gameRoom.stats.gameDuration,
-        numbersCalled: gameRoom.stats.numbersCalled
-      });
-
-      console.log(`Player ${player.name} won game ${gameId} in ${gameRoom.stats.gameDuration}ms`);
-    } else {
-      // Notify others about the mark
-      socket.to(gameId).emit('player-marked-cell', {
-        playerId: player.id,
-        markedCount: player.markedCells.size
-      });
     }
-
-    // Send confirmation to player
-    socket.emit('cell-marked', {
-      cellIndex,
-      markedCount: player.markedCells.size
-    });
   });
 
-  // Chat message
   socket.on('send-chat', (data) => {
     const { gameId, message } = data;
     const connection = playerConnections.get(socket.id);
-    
-    if (!connection) return;
-    
     const gameRoom = gameRooms.get(gameId);
-    if (!gameRoom) return;
+    const player = gameRoom?.players.get(connection.playerId);
 
-    const player = gameRoom.players.get(connection.playerId);
-    if (!player) return;
-
-    // Update last activity
-    player.lastActivity = Date.now();
-
-    // Validate message
-    const trimmedMessage = message.toString().trim().slice(0, 200); // Limit to 200 chars
-    
-    if (trimmedMessage.length === 0) {
-      socket.emit('error', { message: 'Message cannot be empty!' });
-      return;
-    }
-
-    io.to(gameId).emit('chat-message', {
-      playerId: player.id,
-      playerName: player.name,
-      message: trimmedMessage,
-      timestamp: Date.now()
-    });
-  });
-
-  // Player ready status
-  socket.on('player-ready', (data) => {
-    const { gameId, isReady } = data;
-    const connection = playerConnections.get(socket.id);
-    
-    if (!connection) return;
-    
-    const gameRoom = gameRooms.get(gameId);
-    if (!gameRoom) return;
-
-    const player = gameRoom.players.get(connection.playerId);
-    if (!player) return;
-
-    player.isReady = isReady;
-    player.lastActivity = Date.now();
-
-    io.to(gameId).emit('player-ready-updated', {
-      playerId: player.id,
-      isReady: player.isReady,
-      players: Array.from(gameRoom.players.values()).map(p => ({
-        id: p.id,
-        name: p.name,
-        isHost: p.isHost,
-        isReady: p.isReady,
-        markedCount: p.markedCells.size
-      }))
-    });
-  });
-
-  // Leave game
-  socket.on('leave-game', () => {
-    const connection = playerConnections.get(socket.id);
-    if (connection) {
-      leaveGame(socket, connection.gameId, connection.playerId);
-    }
-  });
-
-  // Disconnect
-  socket.on('disconnect', (reason) => {
-    console.log('User disconnected:', socket.id, 'Reason:', reason);
-    
-    const connection = playerConnections.get(socket.id);
-    if (connection) {
-      leaveGame(socket, connection.gameId, connection.playerId);
-    }
-  });
-
-  function leaveGame(socket, gameId, playerId) {
-    const gameRoom = gameRooms.get(gameId);
-    
-    if (gameRoom) {
-      const player = gameRoom.players.get(playerId);
-      
-      // Remove player
-      gameRoom.players.delete(playerId);
-      
-      // Notify other players
-      socket.to(gameId).emit('player-left', {
-        playerId: playerId,
-        playerName: player?.name,
-        players: Array.from(gameRoom.players.values()).map(p => ({
-          id: p.id,
-          name: p.name,
-          isHost: p.isHost,
-          markedCount: p.markedCells.size
-        }))
-      });
-
-      // Clean up empty games
-      if (gameRoom.players.size === 0) {
-        // Stop number calling if game was active
-        if (activeIntervals.has(gameId)) {
-          clearInterval(activeIntervals.get(gameId));
-          activeIntervals.delete(gameId);
-        }
-        
-        gameRooms.delete(gameId);
-        console.log(`Game ${gameId} deleted (no players)`);
-      } else if (playerId === gameRoom.host) {
-        // Assign new host
-        const newHost = Array.from(gameRoom.players.values())[0];
-        gameRoom.host = newHost.id;
-        newHost.isHost = true;
-        
-        io.to(gameId).emit('new-host', { 
-          hostId: newHost.id, 
-          hostName: newHost.name 
-        });
-        
-        console.log(`New host assigned for game ${gameId}: ${newHost.name}`);
-      }
-    }
-    
-    playerConnections.delete(socket.id);
-    
     if (player) {
-      console.log(`Player ${player.name} left game ${gameId}`);
+      io.to(gameId).emit('chat-message', {
+        playerId: player.id, playerName: player.name, message, timestamp: Date.now()
+      });
     }
-  }
+  });
+
+  socket.on('disconnect', () => {
+    const connection = playerConnections.get(socket.id);
+    if (connection) {
+      const { gameId, playerId } = connection;
+      const gameRoom = gameRooms.get(gameId);
+      
+      if (gameRoom) {
+        gameRoom.players.delete(playerId);
+        socket.to(gameId).emit('player-left', { playerId });
+        
+        if (gameRoom.players.size === 0) {
+          gameRooms.delete(gameId);
+        }
+      }
+      playerConnections.delete(socket.id);
+    }
+  });
 
   function startNumberCalling(gameId) {
     const gameRoom = gameRooms.get(gameId);
     if (!gameRoom) return;
 
-    // Clear any existing interval
-    if (activeIntervals.has(gameId)) {
-      clearInterval(activeIntervals.get(gameId));
-    }
-
     const interval = setInterval(() => {
       if (gameRoom.isGameActive && gameRoom.calledNumbers.length < 75) {
-        callNextNumber(gameId);
+        let number;
+        do {
+          number = Math.floor(Math.random() * 75) + 1;
+        } while (gameRoom.calledNumbers.includes(number));
+
+        gameRoom.calledNumbers.push(number);
+        io.to(gameId).emit('number-called', {
+          number, totalCalled: gameRoom.calledNumbers.length
+        });
       } else {
         clearInterval(interval);
-        activeIntervals.delete(gameId);
       }
-    }, gameRoom.settings.numberCallInterval);
-
-    activeIntervals.set(gameId, interval);
+    }, 3000);
   }
-
-  function callNextNumber(gameId) {
-    const gameRoom = gameRooms.get(gameId);
-    if (!gameRoom || !gameRoom.isGameActive) return;
-
-    let number;
-    do {
-      number = Math.floor(Math.random() * 75) + 1;
-    } while (gameRoom.calledNumbers.includes(number));
-
-    gameRoom.calledNumbers.push(number);
-    gameRoom.stats.numbersCalled = gameRoom.calledNumbers.length;
-    
-    io.to(gameId).emit('number-called', {
-      number,
-      totalCalled: gameRoom.calledNumbers.length,
-      calledNumbers: gameRoom.calledNumbers
-    });
-
-    console.log(`Game ${gameId}: Called number ${number}`);
-  }
-});
-
-// Error handling
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`
-🎯 Multiplayer Bingo Backend Server
-📍 Port: ${PORT}
-🌐 Environment: ${process.env.NODE_ENV || 'development'}
-🚀 Ready to accept connections!
-  `);
+  console.log(`Bingo backend running on port ${PORT}`);
 });
-
-export { app, io };
